@@ -1,4 +1,4 @@
-# 🧠 AI Multi-Agent Course Summarizer
+# AI Multi-Agent Course Summarizer
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-00a393.svg)
