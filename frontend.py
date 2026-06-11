@@ -23,7 +23,7 @@ API_BASE_URL = "http://localhost:8000"
 def check_api_health() -> bool:
     """Check if the FastAPI backend is running"""
     try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+        response = requests.get(f"{API_BASE_URL}/health", timeout=100)
         return response.status_code == 200
     except:
         return False

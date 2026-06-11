@@ -9,12 +9,13 @@ import tempfile
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import json
 from datetime import datetime
 from dotenv import load_dotenv
+import hashlib
 import yt_dlp
 import whisper
 import ffmpeg
@@ -24,8 +25,20 @@ import re
 # Load environment variables from .env file
 load_dotenv()
 
-# Load environment variables from .env file
-load_dotenv()
+# Simple cache for loaded Whisper models to avoid repeated heavy loads
+_WHISPER_MODELS = {}
+
+def get_whisper_model(name: str = "base"):
+    """Return a cached Whisper model, loading it on first use.
+
+    Keeps memory/IO overhead lower when transcribing multiple files.
+    """
+    global _WHISPER_MODELS
+    if name in _WHISPER_MODELS:
+        return _WHISPER_MODELS[name]
+    model = whisper.load_model(name)
+    _WHISPER_MODELS[name] = model
+    return model
 
 # Global progress tracking
 progress_store = {}
@@ -74,11 +87,11 @@ async def process_course_background(content: str, title: Optional[str], video_ur
         result = await process_course_async(content, title, video_url, task_id)
         # Store the result in result_store for retrieval
         result_store[task_id] = result
-        update_progress(task_id, "complete", 1.0, "✅ Processing completed successfully!")
+        update_progress(task_id, "complete", 1.0, "Processing completed successfully!")
         print(f"Background processing completed for task {task_id}")
     except Exception as e:
         print(f"Background processing failed for task {task_id}: {str(e)}")
-        update_progress(task_id, "error", 0.0, f"❌ Processing failed: {str(e)}")
+        update_progress(task_id, "error", 0.0, f"Processing failed: {str(e)}")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -100,11 +113,26 @@ except Exception as e:
     print(f"⚠️ Redis not available: {e}")
     redis_client = None
 
-# Initialize Gemini model
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
+# Initialize OpenRouter models
+llm_primary = ChatOpenAI(
+    model="nvidia/nemotron-3-super-120b-a12b:free",
     temperature=0.3,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
+    openai_api_key=os.getenv("OPENROUTER_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
+)
+
+llm_secondary = ChatOpenAI(
+    model="google/gemma-4-31b-it:free",
+    temperature=0.3,
+    openai_api_key=os.getenv("OPENROUTER_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
+)
+
+llm_tertiary = ChatOpenAI(
+    model="openai/gpt-oss-20b:free",
+    temperature=0.3,
+    openai_api_key=os.getenv("OPENROUTER_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
 
 # Pydantic models
@@ -186,7 +214,7 @@ Example: {{"term1": "definition1", "term2": "definition2"}}"""
 async def planner_agent(content: str) -> Dict:
     """Plan the course processing strategy"""
     prompt = ChatPromptTemplate.from_template(PLANNER_PROMPT)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | llm_primary | StrOutputParser()
 
     result = await chain.ainvoke({"content": content})
     try:
@@ -203,7 +231,7 @@ async def planner_agent(content: str) -> Dict:
 async def summarizer_agent(content: str, topics: List[str]) -> str:
     """Generate course summary"""
     prompt = ChatPromptTemplate.from_template(SUMMARIZER_PROMPT)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | llm_secondary | StrOutputParser()
 
     return await chain.ainvoke({
         "content": content,
@@ -222,7 +250,7 @@ async def quiz_generator_agent(content: str, objectives: List[str], quiz_types: 
         num_questions = min(8, max(3, content_length // 1000))  # Scale with content but cap at 8
 
     prompt = ChatPromptTemplate.from_template(QUIZ_GENERATOR_PROMPT)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | llm_tertiary | StrOutputParser()
 
     result = await chain.ainvoke({
         "content": content,
@@ -245,7 +273,7 @@ async def quiz_generator_agent(content: str, objectives: List[str], quiz_types: 
 async def glossary_agent(content: str, terms: List[str]) -> Dict[str, str]:
     """Generate glossary"""
     prompt = ChatPromptTemplate.from_template(GLOSSARY_PROMPT)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | llm_primary | StrOutputParser()
 
     result = await chain.ainvoke({
         "content": content,
@@ -261,7 +289,7 @@ async def glossary_agent(content: str, terms: List[str]) -> Dict[str, str]:
 async def reviewer_agent(summary: str, quiz: List[Dict], glossary: Dict[str, str]) -> Dict:
     """Review and validate output quality"""
     prompt = ChatPromptTemplate.from_template(REVIEWER_PROMPT)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | llm_secondary | StrOutputParser()
 
     result = await chain.ainvoke({
         "summary": summary,
@@ -272,41 +300,73 @@ async def reviewer_agent(summary: str, quiz: List[Dict], glossary: Dict[str, str
     return {"review": result, "approved": True}
 
 # Video processing functions
-def load_whisper_model():
-    """Load Whisper model for transcription"""
-    return whisper.load_model("base")
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    """Extract the video ID from a YouTube URL"""
+    patterns = [
+        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})',
+        r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})',
+        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
+        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/v\/([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
 
-# Video processing functions
 async def process_video_content(video_url: str, task_id: str = None) -> str:
     """Process video URL and extract transcript with progress tracking"""
+    # First, try to fetch YouTube captions directly
+    video_id = extract_youtube_video_id(video_url)
+    if video_id:
+        try:
+            if task_id:
+                update_progress(task_id, "downloading", 0.1, " Fetching YouTube captions directly...")
+            print(f" Attempting to fetch YouTube captions for video ID: {video_id}")
+            from youtube_transcript_api import YouTubeTranscriptApi
+            ytt_api = YouTubeTranscriptApi()
+            fetched_transcript = await asyncio.get_event_loop().run_in_executor(
+                None, ytt_api.fetch, video_id
+            )
+            # Combine transcript text
+            transcript = " ".join([snippet.text for snippet in fetched_transcript])
+            print(f" Captions fetched successfully: {len(transcript)} characters")
+            if task_id:
+                update_progress(task_id, "transcribing", 0.9, " Captions fetched successfully")
+            return transcript
+        except Exception as e:
+            print(f" Could not fetch direct captions: {str(e)}. Falling back to audio transcription.")
+            if task_id:
+                update_progress(task_id, "downloading", 0.1, " Direct captions failed, falling back to audio download...")
+
     # Use a persistent temp file
     import uuid
     temp_audio_path = f"temp_audio_{uuid.uuid4().hex}.m4a"
 
     try:
-        print(f"🎬 Processing video: {video_url}")
+        print(f" Processing video audio fallback: {video_url}")
 
         # Step 1: Download audio
         if task_id:
-            update_progress(task_id, "downloading", 0.1, "📥 Downloading video audio...")
-        print("📥 Downloading audio...")
+            update_progress(task_id, "downloading", 0.1, " Downloading video audio...")
+        print(" Downloading audio...")
         audio_path = await asyncio.get_event_loop().run_in_executor(
             None, download_video_audio_persistent, video_url, temp_audio_path
         )
-        print(f"✅ Audio downloaded: {os.path.getsize(audio_path)} bytes")
+        print(f" Audio downloaded: {os.path.getsize(audio_path)} bytes")
         if task_id:
-            update_progress(task_id, "downloading", 0.3, "✅ Audio downloaded successfully")
+            update_progress(task_id, "downloading", 0.3, " Audio downloaded successfully")
 
         # Step 2: Transcribe audio (this is the longest step)
         if task_id:
-            update_progress(task_id, "transcribing", 0.4, "🎙️ Transcribing speech to text...")
-        print("🎙️ Transcribing audio with Whisper... (this may take several minutes)")
+            update_progress(task_id, "transcribing", 0.4, " Transcribing speech to text...")
+        print(" Transcribing audio with Whisper... (this may take several minutes)")
         transcript = await asyncio.get_event_loop().run_in_executor(
             None, transcribe_audio, audio_path
         )
-        print(f"✅ Transcription completed: {len(transcript)} characters")
+        print(f" Transcription completed: {len(transcript)} characters")
         if task_id:
-            update_progress(task_id, "transcribing", 0.9, "✅ Transcription completed")
+            update_progress(task_id, "transcribing", 0.9, " Transcription completed")
 
         return transcript
 
@@ -378,7 +438,7 @@ def transcribe_audio(audio_path: str) -> str:
 
     try:
         # Load Whisper model (cached for performance)
-        model = whisper.load_model("base")
+        model = get_whisper_model("base")
         result = model.transcribe(audio_path, fp16=False)  # Disable fp16 for CPU
         transcript = result["text"].strip()
 
@@ -393,7 +453,7 @@ def transcribe_audio(audio_path: str) -> str:
         # Try with tiny model as fallback
         try:
             print("Trying with tiny model...")
-            model = whisper.load_model("tiny")
+            model = get_whisper_model("tiny")
             result = model.transcribe(audio_path, fp16=False)
             transcript = result["text"].strip()
 
@@ -406,6 +466,21 @@ def transcribe_audio(audio_path: str) -> str:
         # Final fallback
         raise Exception(f"All transcription attempts failed. Original error: {str(e)}")
 
+async def run_with_retry(func, *args, **kwargs):
+    """Simple retry wrapper with backoff for rate limits"""
+    for attempt in range(6):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower() or attempt == 5:
+                if attempt == 5:
+                    raise
+                wait_time = 15 * (attempt + 1)
+                print(f" Upstream rate limit hit! Retrying in {wait_time}s... (Attempt {attempt+1}/5)")
+                await asyncio.sleep(wait_time)
+            else:
+                raise e
+
 # Main processing pipeline
 async def process_course_async(content: str, title: Optional[str] = None, video_url: Optional[str] = None, task_id: str = None) -> Dict:
     """Asynchronous course processing pipeline with caching"""
@@ -414,15 +489,16 @@ async def process_course_async(content: str, title: Optional[str] = None, video_
     source_type = "text"
     if video_url:
         if task_id:
-            update_progress(task_id, "analyzing", 0.0, "🎬 Analyzing video URL...")
+            update_progress(task_id, "analyzing", 0.0, " Analyzing video URL...")
         content = await process_video_content(video_url, task_id)
         source_type = "video"
 
     if task_id:
-        update_progress(task_id, "planning", 0.1, "🧠 Planning course structure...")
+        update_progress(task_id, "planning", 0.1, " Planning course structure...")
 
     # Check cache if Redis is available
-    cache_key = f"course:{hash(content)}"
+    content_bytes = (content or "").encode("utf-8")
+    cache_key = f"course:{hashlib.sha256(content_bytes).hexdigest()}"
     cached_result = None
     if redis_available and redis_client:
         try:
@@ -431,7 +507,7 @@ async def process_course_async(content: str, title: Optional[str] = None, video_
                 cached_data = json.loads(cached_result)
                 cached_data["source_type"] = source_type
                 if task_id:
-                    update_progress(task_id, "complete", 1.0, "✅ Processing completed (from cache)")
+                    update_progress(task_id, "complete", 1.0, " Processing completed (from cache)")
                 return cached_data
         except Exception as e:
             print(f"Redis cache read error: {e}")
@@ -439,33 +515,38 @@ async def process_course_async(content: str, title: Optional[str] = None, video_
     start_time = datetime.now()
 
     # Execute agents asynchronously
-    plan_task = asyncio.create_task(planner_agent(content))
+    plan_task = asyncio.create_task(run_with_retry(planner_agent, content))
 
     # Wait for planner
     plan = await plan_task
     if task_id:
-        update_progress(task_id, "planning", 0.2, "✅ Course structure planned")
+        update_progress(task_id, "planning", 0.2, " Course structure planned")
 
-    # Execute remaining agents in parallel
+    # Execute agents sequentially to avoid bursting the API rate limits (429 errors)
     if task_id:
-        update_progress(task_id, "processing", 0.3, "🤖 Running AI agents in parallel...")
-    summary_task = asyncio.create_task(summarizer_agent(content, plan.get("topics", [])))
-    quiz_task = asyncio.create_task(quiz_generator_agent(
+        update_progress(task_id, "processing", 0.3, " Generating summary...")
+    summary = await run_with_retry(summarizer_agent, content, plan.get("topics", []))
+    
+    if task_id:
+        update_progress(task_id, "processing", 0.5, " Generating quiz...")
+    quiz = await run_with_retry(
+        quiz_generator_agent,
         content,
         plan.get("objectives", []),
         plan.get("quiz_types", [])
-    ))
-    glossary_task = asyncio.create_task(glossary_agent(content, plan.get("glossary_terms", [])))
-
-    # Wait for all agents
-    summary, quiz, glossary = await asyncio.gather(summary_task, quiz_task, glossary_task)
+    )
+    
     if task_id:
-        update_progress(task_id, "processing", 0.8, "✅ AI agents completed")
+        update_progress(task_id, "processing", 0.7, " Extracting glossary...")
+    glossary = await run_with_retry(glossary_agent, content, plan.get("glossary_terms", []))
+
+    if task_id:
+        update_progress(task_id, "processing", 0.8, " AI agents completed")
 
     # Review results
     if task_id:
-        update_progress(task_id, "reviewing", 0.9, "✅ Reviewing quality...")
-    review = await reviewer_agent(summary, quiz, glossary)
+        update_progress(task_id, "reviewing", 0.9, " Reviewing quality...")
+    review = await run_with_retry(reviewer_agent, summary, quiz, glossary)
 
     processing_time = (datetime.now() - start_time).total_seconds()
 
@@ -487,7 +568,7 @@ async def process_course_async(content: str, title: Optional[str] = None, video_
             print(f"Redis cache write error: {e}")
 
     if task_id:
-        update_progress(task_id, "complete", 1.0, "✅ Processing completed successfully")
+        update_progress(task_id, "complete", 1.0, " Processing completed successfully")
 
     return result
 
@@ -503,15 +584,15 @@ async def process_course(request: CourseRequest, background_tasks: BackgroundTas
     if request.content and request.video_url:
         raise HTTPException(status_code=400, detail="Provide either content OR video_url, not both")
 
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise HTTPException(status_code=500, detail="Google API key not configured")
+    if not os.getenv("OPENROUTER_KEY"):
+        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     # Generate task ID for progress tracking
     import uuid
     task_id = str(uuid.uuid4())
 
     # Initialize progress
-    update_progress(task_id, "starting", 0.0, "🚀 Starting processing...")
+    update_progress(task_id, "starting", 0.0, " Starting processing...")
 
     # Start background processing
     background_tasks.add_task(

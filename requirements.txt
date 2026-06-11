@@ -1,6 +1,6 @@
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
-langchain-google-genai==1.0.1
+uvicorn==0.24.0
+langchain-openai
 langchain-core==0.1.25
 redis==5.0.1
 pydantic==2.5.0
@@ -17,3 +17,4 @@ openai-whisper==20231117
 torch==2.1.0
 torchaudio==2.1.0
 ffmpeg-python==0.2.0
+youtube-transcript-api==0.6.2
