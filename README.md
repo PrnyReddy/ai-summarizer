@@ -14,7 +14,7 @@ An advanced, asynchronous AI pipeline that automatically extracts, transcribes, 
 * **Hybrid Video Ingestion:** Seamlessly processes YouTube videos via direct closed-caption extraction or fallback audio downloads (`yt-dlp`) transcribed via **OpenAI Whisper**.
 * **Zero-Cost Scalability:** Intelligently bypasses free-tier API rate limits ("Burst" Concurrency & TPM limits) via custom **Sequential Queueing** and an **Exponential Backoff** retry loop.
 * **LLM Load Balancing:** Dynamically routes traffic across 3 distinct high-capacity models via OpenRouter (`nemotron-120b`, `gemma-31b`, `gpt-oss-20b`) for maximum efficiency.
-* **Persistent Caching:** Integrates Redis SHA256 hashing to cache generated course materials, reducing redundant processing time by 100%.
+* **Persistent Caching:** Integrates Redis SHA256 hashing to cache generated course materials, reducing redundant processing time.
 
 ## Tech Stack
 
